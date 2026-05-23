@@ -334,17 +334,25 @@ Two MCP endpoints exist: `blueprints/mcp_http.py` (streamable HTTP transport for
 
 OpenAlgo uses an event-driven architecture where state changes are broadcast to the UI in real-time:
 
-1. **Flask-SocketIO events**: Order placement, modification, cancellation, position updates, and analyzer results all emit SocketIO events (e.g., `order_update`, `analyzer_update`, `cache_loaded`). The React frontend subscribes to these events for live dashboard updates without polling.
+1. **In-process EventBus** (`utils/event_bus.py`): A lightweight pub/sub bus decouples order execution from side-effects. Services publish typed events (dataclasses in `events/`); subscribers in `subscribers/` react asynchronously via a shared `ThreadPoolExecutor`. Adding a new notification channel requires only a new subscriber — no changes to service code.
 
-2. **WebSocket Proxy**: Unified market data streaming (port 8765) — see WebSocket Architecture above.
+   - `events/` — typed event dataclasses (`OrderEvent`, `PositionEvent`, `SandboxEvent`, etc.)
+   - `subscribers/socketio_subscriber.py` — re-emits to browser via Flask-SocketIO
+   - `subscribers/telegram_subscriber.py` — sends Telegram alerts
+   - `subscribers/whatsapp_subscriber.py` — sends WhatsApp alerts
+   - `subscribers/log_subscriber.py` — writes to traffic/API log tables
 
-3. **ZeroMQ PUB/SUB**: Internal message bus between broker adapters and WebSocket proxy (port 5555). Also used for cache invalidation events across modules.
+2. **Flask-SocketIO** (`extensions.py`): The `socketio` singleton is defined with `async_mode="threading"` — **not** eventlet mode. This is intentional: it avoids greenlet threading errors under concurrent order placement even though the production server runs eventlet workers. Key SocketIO event names emitted to the browser: `order_event`, `modify_order_event`, `cancel_order_event`, `close_position_event`, `analyzer_update`, `cache_loaded`.
+
+3. **WebSocket Proxy**: Unified market data streaming (port 8765) — see WebSocket Architecture above.
+
+4. **ZeroMQ PUB/SUB**: Internal message bus between broker adapters and WebSocket proxy (port 5555). Also used for cache invalidation events across modules.
 
 Key event flows:
-- **Order placed** → `order_router_service.py` → broker API → `socketio.emit("order_update")` → UI updates
+- **Order placed** → `order_router_service.py` → broker API → `bus.publish(OrderPlacedEvent)` → subscribers fan out (SocketIO `order_event` to browser, Telegram alert, log write)
 - **Market data tick** → broker WebSocket adapter → ZeroMQ PUB → WebSocket proxy → client browser
 - **Master contract loaded** → `master_contract_cache_hook.py` → `socketio.emit("cache_loaded")` → UI notified
-- **Analyzer trade** → `sandbox_service.py` → `socketio.emit("analyzer_update")` → sandbox UI updates
+- **Analyzer trade / sandbox fill** → `bus.publish(SandboxEvent)` → `socketio.emit("analyzer_update")` → sandbox UI updates
 
 ## Important Configuration
 
